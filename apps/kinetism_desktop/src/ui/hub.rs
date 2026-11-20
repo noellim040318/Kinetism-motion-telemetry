@@ -82,9 +82,10 @@ impl KinetismApp {
             })
             .collect::<Vec<_>>()
             .join("   ");
-        let cards: [(&str, &str, String, &str, bool, Screen); 4] = [
+        let cards: [(&str, &str, String, &str, bool, Screen); 5] = [
             ("📐", "Measure", "Shoulder abduction or elbow flexion: calibrate, capture angle, load and an MMT suggestion.".into(), "Start measuring", true, Screen::Measure),
             ("🍎", "Play: Fruit PNF", format!("{level_line}\n{UNLOCK_SCORE_PERCENT:.0}% unlocks the next level."), "Play", true, Screen::Play),
+            ("🧊", "3D arm and fruit", "See both arm segments in 3D with forearm rotation, and play the 3D PNF fruit game. Practice only, nothing is saved.".into(), "Open 3D view", false, Screen::Lab3d),
             ("💪", "Progress on muscle", "Body map, daily MMT level, MMT and game trends with next-goal guidance.".into(), "View progress", false, Screen::Progress),
             ("🗂", "Record log", format!("{record_count} measurement records for this patient, plus game sessions."), "Open record log", false, Screen::Records),
         ];

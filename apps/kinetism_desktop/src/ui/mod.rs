@@ -3,6 +3,8 @@
 pub mod figures;
 pub mod game_view;
 pub mod hub;
+pub mod lab3d;
+pub mod limb3d;
 pub mod measure;
 pub mod patients;
 pub mod progress;

@@ -1,6 +1,11 @@
 //! Live arm tracking: calibration flow, smoothed pose, peaks and history.
 
+use crate::arm3d::{ArmSkeleton, skeleton, skeleton_with_hand};
 use crate::clinical::Side;
+use crate::forearm::{
+    ForearmRotation, NeutralAccumulator, NeutralStatus, RotationCalibration, Unreliable,
+    relative_orientation,
+};
 use crate::game::Pt;
 use crate::kinematics::{
     AccumulateStatus, ArmPose, Calibration, PoseAccumulator, RestCapture, Smoother,
@@ -51,6 +56,11 @@ pub struct ArmTracker {
     started: Instant,
     /// Arrival of the latest frame carrying the upper-arm orientation.
     pub last_frame_at: Option<Instant>,
+    /// Neutral forearm position, once captured (3D view and game only).
+    pub rotation_cal: Option<RotationCalibration>,
+    /// Latest forearm rotation estimate; `None` until the neutral is captured.
+    pub forearm_rotation: Option<Result<ForearmRotation, Unreliable>>,
+    neutral: Option<NeutralAccumulator>,
 }
 
 impl ArmTracker {
@@ -73,7 +83,68 @@ impl ArmTracker {
             history: VecDeque::new(),
             started: Instant::now(),
             last_frame_at: None,
+            rotation_cal: None,
+            forearm_rotation: None,
+            neutral: None,
         }
+    }
+
+    /// Start capturing the neutral forearm position (elbow straight, thumb
+    /// forward). Needs the arm calibration first.
+    pub fn start_neutral_capture(&mut self) {
+        if self.is_calibrated() {
+            self.neutral = Some(NeutralAccumulator::default());
+            self.rotation_cal = None;
+            self.forearm_rotation = None;
+        }
+    }
+
+    pub fn is_capturing_neutral(&self) -> bool {
+        self.neutral.is_some()
+    }
+
+    pub fn neutral_progress(&self) -> f32 {
+        self.neutral
+            .as_ref()
+            .map_or(0.0, NeutralAccumulator::progress)
+    }
+
+    pub fn has_rotation_calibration(&self) -> bool {
+        self.rotation_cal.is_some()
+    }
+
+    /// Forearm rotation in degrees (pronation positive) when it can be trusted
+    /// right now: calibrated, fresh data and a reliable estimate.
+    pub fn reliable_rotation_deg(&self) -> Option<f64> {
+        if !self.has_fresh_data() {
+            return None;
+        }
+        self.forearm_rotation?.ok().map(|r| r.angle_deg)
+    }
+
+    /// The 3D arm for the latest pose. `None` until calibrated. Once the
+    /// forearm neutral is set the palm follows the forearm sensor's full
+    /// orientation (shoulder rotation, elbow and forearm roll together);
+    /// before that the palm is only a neutral-hand placeholder.
+    pub fn skeleton(&self) -> Option<ArmSkeleton> {
+        let pose = self.pose?;
+        if let (Some(q), Some(palm_sensor)) = (
+            pose.forearm_orientation,
+            self.rotation_cal.and_then(|r| r.palm_sensor()),
+        ) {
+            return Some(skeleton_with_hand(
+                pose.upper_dir,
+                pose.forearm_dir,
+                q.rotate(palm_sensor),
+                self.side,
+            ));
+        }
+        Some(skeleton(
+            pose.upper_dir,
+            pose.forearm_dir,
+            self.reliable_rotation_deg(),
+            self.side,
+        ))
     }
 
     pub fn is_calibrated(&self) -> bool {
@@ -110,6 +181,9 @@ impl ArmTracker {
         self.pose = None;
         self.hand = None;
         self.smoother.reset();
+        self.rotation_cal = None;
+        self.forearm_rotation = None;
+        self.neutral = None;
         // Angles from the old calibration mean nothing under the new one.
         self.history.clear();
         self.reset_peaks();
@@ -200,6 +274,7 @@ impl ArmTracker {
                 _ => {}
             }
             if let Some(cal) = self.calibration {
+                self.update_rotation(&cal, upper, tf.frame.forearm);
                 let pose = cal.pose(upper, tf.frame.forearm, self.side);
                 let hand = self.smoother.update(pose.hand, 0.45);
                 self.hand = Some(hand);
@@ -218,6 +293,31 @@ impl ArmTracker {
             }
         }
         resumed
+    }
+
+    fn update_rotation(
+        &mut self,
+        cal: &crate::kinematics::Calibration,
+        upper: crate::math::Quat,
+        forearm: Option<crate::math::Quat>,
+    ) {
+        if let (Some(acc), Some(f), Some(axis)) = (self.neutral.as_mut(), forearm, cal.forearm_axis)
+            && let Some(rel) = relative_orientation(upper, f, cal.forearm_yaw_offset)
+        {
+            match acc.push(rel) {
+                NeutralStatus::Done(mean) => {
+                    self.rotation_cal =
+                        RotationCalibration::new(mean, axis, cal.forearm_yaw_offset)
+                            .map(|r| r.with_palm(cal.neutral_palm_in_sensor(f, self.side)));
+                    self.neutral = None;
+                }
+                NeutralStatus::Moving => self.moving_warning = true,
+                NeutralStatus::Collecting(_) => self.moving_warning = false,
+            }
+        }
+        self.forearm_rotation = self
+            .rotation_cal
+            .map(|rot| rot.estimate(upper, forearm, self.side));
     }
 
     fn finish_capture(&mut self) {
@@ -795,6 +895,87 @@ mod tests {
             tracker.hand,
             Some(tracker.pose.expect("pose").hand),
             "no glide across the gap"
+        );
+    }
+
+    #[test]
+    fn neutral_capture_needs_calibration_then_enables_forearm_rotation() {
+        let mut sim = SimArm::new(Side::Right);
+        let mut tracker = ArmTracker::new(Side::Right);
+        tracker.start_neutral_capture();
+        assert!(
+            !tracker.is_capturing_neutral(),
+            "no neutral capture before the arm is calibrated"
+        );
+
+        calibrate(&mut tracker, &mut sim, true);
+        assert!(!tracker.has_rotation_calibration());
+        assert_eq!(
+            tracker.forearm_rotation, None,
+            "no estimate before the neutral is set"
+        );
+        assert_eq!(tracker.reliable_rotation_deg(), None);
+
+        tracker.start_neutral_capture();
+        assert!(tracker.is_capturing_neutral());
+        tracker.feed(&frames(&sim, crate::forearm::NEUTRAL_SAMPLES, true));
+        assert!(tracker.has_rotation_calibration());
+        assert!(!tracker.is_capturing_neutral());
+        let neutral = tracker.reliable_rotation_deg().expect("estimate");
+        assert!(neutral.abs() < 0.5, "neutral reads about 0: {neutral}");
+
+        sim.pronation_deg = -45.0;
+        tracker.feed(&frames(&sim, 2, true));
+        let supination = tracker.reliable_rotation_deg().expect("estimate");
+        assert!((supination + 45.0).abs() < 0.5, "{supination}");
+        let sk = tracker.skeleton().expect("skeleton");
+        assert!(sk.forearm_measured);
+
+        // Without the forearm sensor there is no estimate and the wrist is not measured.
+        tracker.feed(&frames(&sim, 2, false));
+        assert_eq!(
+            tracker.forearm_rotation,
+            Some(Err(crate::forearm::Unreliable::NoForearmSensor))
+        );
+        assert_eq!(tracker.reliable_rotation_deg(), None);
+        assert!(!tracker.skeleton().expect("skeleton").forearm_measured);
+
+        // A new calibration invalidates the neutral.
+        tracker.recalibrate();
+        assert!(!tracker.has_rotation_calibration());
+        assert_eq!(tracker.forearm_rotation, None);
+        assert!(tracker.skeleton().is_none());
+    }
+
+    #[test]
+    fn neutral_capture_restarts_while_the_forearm_moves() {
+        let mut sim = SimArm::new(Side::Left);
+        let mut tracker = ArmTracker::new(Side::Left);
+        calibrate(&mut tracker, &mut sim, true);
+        tracker.start_neutral_capture();
+        tracker.feed(&frames(&sim, 5, true));
+        sim.pronation_deg = 30.0;
+        tracker.feed(&frames(&sim, 1, true));
+        assert!(tracker.moving_warning, "moving during the capture warns");
+        assert!(tracker.neutral_progress() < 0.1);
+        assert!(!tracker.has_rotation_calibration());
+        sim.pronation_deg = 0.0;
+        tracker.feed(&frames(&sim, crate::forearm::NEUTRAL_SAMPLES, true));
+        assert!(tracker.has_rotation_calibration());
+    }
+
+    #[test]
+    fn switching_arm_discards_the_forearm_neutral() {
+        let mut sim = SimArm::new(Side::Right);
+        let mut tracker = ArmTracker::new(Side::Right);
+        calibrate(&mut tracker, &mut sim, true);
+        tracker.start_neutral_capture();
+        tracker.feed(&frames(&sim, crate::forearm::NEUTRAL_SAMPLES, true));
+        assert!(tracker.has_rotation_calibration());
+        tracker.set_side(Side::Left);
+        assert!(
+            !tracker.has_rotation_calibration(),
+            "mirrored sign: recalibrate"
         );
     }
 }

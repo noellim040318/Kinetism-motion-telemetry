@@ -9,6 +9,7 @@ pub mod pnf;
 
 use crate::clinical::Side;
 use crate::model::{GameLevel, GameSession, Patient, SOURCE_DESKTOP, UNLOCK_SCORE_PERCENT, new_id};
+use crate::pnf3d::{Frame, PnfConfig, PnfEvent as Pnf3dEvent, PnfPattern, Round3d};
 use apple::{AppleTracer, TraceEvent, apple_path};
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use pnf::{FruitKind, PnfEvent, PnfRound};
@@ -130,6 +131,8 @@ pub struct AppleRound {
 pub enum Mode {
     Apple(AppleRound),
     Pnf(PnfRound),
+    /// Levels 1-2 in 3D: true 3D positions and collision (see [`crate::pnf3d`]).
+    Pnf3d(Box<Round3d>),
 }
 
 #[derive(Clone, Debug)]
@@ -186,10 +189,92 @@ impl Game {
         }
     }
 
+    /// Levels 1-2 played in 3D: D1 or D2 flexion, with the reach sized to the
+    /// patient's abduction range exactly like the 2D game. Scoring, stars,
+    /// unlocking and saving use the same session fields as the 2D game.
+    pub fn new_3d(level: GameLevel, side: Side, max_abduction_deg: Option<f64>, reps: u32) -> Self {
+        let pattern = if level == GameLevel::PnfD1 {
+            PnfPattern::D1Flexion
+        } else {
+            PnfPattern::D2Flexion
+        };
+        let config = PnfConfig {
+            reach: reach_from_rom(max_abduction_deg),
+            reps,
+            ..PnfConfig::new(pattern, side)
+        };
+        Self {
+            level,
+            side,
+            mode: Mode::Pnf3d(Box::new(Round3d::new(config))),
+            stage: Stage::Countdown(COUNTDOWN),
+            elapsed: 0.0,
+            max_elevation: 0.0,
+            practice: false,
+        }
+    }
+
+    /// One step of a 3D round. `frame` is `None` whenever tracking is
+    /// unavailable (sensor gap, no calibration): nothing is scored then.
+    /// Returns the game events and the raw 3D round events.
+    pub fn update_3d(
+        &mut self,
+        frame: Option<Frame>,
+        elevation_deg: f64,
+        dt: f64,
+    ) -> (Vec<GameEvent>, Vec<Pnf3dEvent>) {
+        let mut events = Vec::new();
+        let mut raw = Vec::new();
+        match self.stage {
+            Stage::Finished => return (events, raw),
+            Stage::Countdown(left) => {
+                let left = left - dt;
+                if left <= 0.0 {
+                    self.stage = Stage::Playing;
+                    events.push(GameEvent::Go);
+                } else {
+                    self.stage = Stage::Countdown(left);
+                }
+                return (events, raw);
+            }
+            Stage::Playing => {}
+        }
+        self.elapsed += dt;
+        if elevation_deg.is_finite() {
+            self.max_elevation = self.max_elevation.max(elevation_deg);
+        }
+        let mut finished = false;
+        if let Mode::Pnf3d(round) = &mut self.mode {
+            for e in round.update(frame, dt) {
+                match &e {
+                    Pnf3dEvent::RepStarted(n) => events.push(GameEvent::RepStarted(*n)),
+                    Pnf3dEvent::Sliced { pos, kind } => events.push(GameEvent::FruitSliced {
+                        pos: [pos.x, pos.z],
+                        kind: *kind,
+                        clean: true,
+                    }),
+                    Pnf3dEvent::ReachedTop => events.push(GameEvent::ReachedTop),
+                    Pnf3dEvent::RepScored(rep) => events.push(GameEvent::RepDone {
+                        clean: rep.reached_top && rep.fruits_sliced == rep.fruits_total,
+                        combo: 0,
+                    }),
+                    Pnf3dEvent::Finished => finished = true,
+                    Pnf3dEvent::RepDiscarded | Pnf3dEvent::TrackingLost => {}
+                }
+                raw.push(e);
+            }
+        }
+        if finished {
+            self.finish(&mut events);
+        }
+        (events, raw)
+    }
+
     pub fn points(&self) -> i64 {
         match &self.mode {
             Mode::Apple(a) => a.points,
             Mode::Pnf(r) => r.points,
+            Mode::Pnf3d(r) => r.points,
         }
     }
 
@@ -197,6 +282,7 @@ impl Game {
         let fraction = match &self.mode {
             Mode::Apple(a) => a.scores.iter().sum::<f64>() / f64::from(APPLES_PER_ROUND),
             Mode::Pnf(r) => r.score_fraction(),
+            Mode::Pnf3d(r) => r.spatial_fraction(),
         };
         (fraction * 100.0).clamp(0.0, 100.0)
     }
@@ -248,7 +334,7 @@ impl Game {
                 }
             }
             Mode::Apple(_) => {}
-            Mode::Pnf(_) => self.finish(&mut events),
+            Mode::Pnf(_) | Mode::Pnf3d(_) => self.finish(&mut events),
         }
         events
     }
@@ -257,8 +343,10 @@ impl Game {
     /// next sample starts a new stroke rather than a slice across the gap.
     pub fn interrupt(&mut self) {
         // The apple tracer only tests single hand positions, never segments.
-        if let Mode::Pnf(round) = &mut self.mode {
-            round.interrupt();
+        match &mut self.mode {
+            Mode::Pnf(round) => round.interrupt(),
+            Mode::Pnf3d(round) => round.interrupt(),
+            Mode::Apple(_) => {}
         }
     }
 
@@ -304,6 +392,7 @@ impl Game {
                     }
                 }
             }
+            Mode::Pnf3d(_) => {}
             Mode::Pnf(round) => {
                 for e in round.update(hand, dt) {
                     events.push(match e {
@@ -349,6 +438,22 @@ impl Game {
                 r.session_accuracy() * 100.0,
                 r.rep_scores.len() as f64 / f64::from(r.reps_total) * 100.0,
             ),
+            Mode::Pnf3d(r) => {
+                let n = r.results.len().max(1) as f64;
+                (
+                    r.scored_reps(),
+                    r.results
+                        .iter()
+                        .filter(|x| x.reached_top && x.fruits_sliced == x.fruits_total)
+                        .count() as u32,
+                    0,
+                    0,
+                    r.results.iter().map(|x| x.within_tolerance).sum::<f64>() / n
+                        * 100.0
+                        * if r.results.is_empty() { 0.0 } else { 1.0 },
+                    f64::from(r.scored_reps()) / f64::from(r.config.reps) * 100.0,
+                )
+            }
         };
         GameSession {
             id: new_id("game"),
@@ -503,7 +608,7 @@ mod tests {
         for _ in 0..APPLES_PER_ROUND {
             let pts = match &game.mode {
                 Mode::Apple(a) => a.tracer.path.points.clone(),
-                Mode::Pnf(_) => unreachable!(),
+                Mode::Pnf(_) | Mode::Pnf3d(_) => unreachable!(),
             };
             for p in &pts {
                 events.extend(game.update(*p, 70.0, 0.1));
@@ -655,7 +760,7 @@ mod tests {
         assert!(game.update([0.0, 0.0], 40.0, 3.1).contains(&GameEvent::Go));
         let path = match &game.mode {
             Mode::Pnf(round) => round.path,
-            Mode::Apple(_) => unreachable!("level 2 is a PNF round"),
+            Mode::Apple(_) | Mode::Pnf3d(_) => unreachable!("level 2 is a 2D PNF round"),
         };
         assert!(
             game.update(path.start, 40.0, 0.05)
@@ -704,7 +809,7 @@ mod tests {
         );
         let path = match &game.mode {
             Mode::Pnf(round) => round.path,
-            Mode::Apple(_) => unreachable!("level 2 is a PNF round"),
+            Mode::Apple(_) | Mode::Pnf3d(_) => unreachable!("level 2 is a 2D PNF round"),
         };
         let mut events = Vec::new();
         for _ in 0..2 {
@@ -787,7 +892,7 @@ mod tests {
         assert!(game.update([0.0, 0.0], 0.0, 3.1).contains(&GameEvent::Go));
         let pts = match &game.mode {
             Mode::Apple(round) => round.tracer.path.points.clone(),
-            Mode::Pnf(_) => unreachable!("level 0 is the apple"),
+            Mode::Pnf(_) | Mode::Pnf3d(_) => unreachable!("level 0 is the apple"),
         };
         for p in &pts[..pts.len() / 4] {
             game.update(*p, 60.0, 0.1);
@@ -799,7 +904,7 @@ mod tests {
         };
         let (coverage, tracer_score) = match &game.mode {
             Mode::Apple(round) => (round.tracer.coverage(), round.tracer.score()),
-            Mode::Pnf(_) => unreachable!(),
+            Mode::Pnf(_) | Mode::Pnf3d(_) => unreachable!(),
         };
         assert_eq!(
             score, tracer_score,
@@ -851,5 +956,120 @@ mod tests {
             s.completion_percent
         );
         assert!(game.skip().is_empty(), "nothing to skip after the round");
+    }
+
+    fn frame3d(path: &crate::pnf3d::Trajectory, t: f64) -> Option<Frame> {
+        let wrist = path.point(t);
+        Some(Frame {
+            wrist,
+            blade_tip: wrist + path.tangent(t).scale(0.42),
+            rotation_deg: None,
+        })
+    }
+
+    /// One clean rep along the 3D path: dwell at the start, swipe, return.
+    fn play_3d_rep(game: &mut Game, path: &crate::pnf3d::Trajectory) -> Vec<GameEvent> {
+        let mut events = Vec::new();
+        for _ in 0..8 {
+            events.extend(game.update_3d(frame3d(path, 0.0), 50.0, 0.05).0);
+        }
+        for i in 1..=60 {
+            let t = f64::from(i) / 60.0;
+            events.extend(game.update_3d(frame3d(path, t), 80.0 + t * 40.0, 0.05).0);
+        }
+        for i in 1..=20 {
+            let t = 1.0 - f64::from(i) / 20.0;
+            events.extend(game.update_3d(frame3d(path, t), 60.0, 0.05).0);
+        }
+        events
+    }
+
+    #[test]
+    fn a_3d_round_counts_down_scores_stars_and_saves_like_the_2d_game() {
+        let mut game = Game::new_3d(GameLevel::PnfD2, Side::Right, Some(150.0), 2);
+        let Mode::Pnf3d(round) = &game.mode else {
+            unreachable!("level 2 in 3D");
+        };
+        let path = round.trajectory;
+        assert_eq!(round.config.pattern, PnfPattern::D2Flexion);
+        // The countdown does not score or count elevation.
+        let (events, _) = game.update_3d(frame3d(&path, 0.0), 90.0, 1.0);
+        assert!(events.is_empty() && matches!(game.stage, Stage::Countdown(_)));
+        assert_eq!(game.max_elevation, 0.0);
+        assert!(game.update_3d(None, 0.0, 3.0).0.contains(&GameEvent::Go));
+
+        let mut events = play_3d_rep(&mut game, &path);
+        events.extend(play_3d_rep(&mut game, &path));
+        assert_eq!(game.stage, Stage::Finished);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, GameEvent::Finished { stars: 3, .. })),
+            "{events:?}"
+        );
+        assert!(game.final_score() > 90.0, "{}", game.final_score());
+        assert_eq!(game.stars(), 3);
+        assert!(game.max_elevation >= 120.0 - 1e-9, "elevation is tracked");
+        let fruit = events
+            .iter()
+            .filter(|e| matches!(e, GameEvent::FruitSliced { .. }))
+            .count();
+        assert!(fruit >= 6, "fruit was sliced in 3D: {fruit}");
+
+        let session = game.to_session(&patient(), Utc::now());
+        assert_eq!(session.level, GameLevel::PnfD2);
+        assert_eq!(
+            (session.reps, session.clean_reps, session.bombs_hit),
+            (2, 2, 0)
+        );
+        assert!((session.completion_percent - 100.0).abs() < 1e-9);
+        assert!(session.accuracy_percent > 90.0);
+        assert_eq!(session.score_percent, game.final_score());
+    }
+
+    #[test]
+    fn a_3d_round_without_tracking_scores_nothing() {
+        let mut game = Game::new_3d(GameLevel::PnfD1, Side::Left, None, 3);
+        game.update_3d(None, 0.0, 3.1);
+        assert_eq!(game.stage, Stage::Playing);
+        for _ in 0..400 {
+            game.interrupt();
+            let (events, _) = game.update_3d(None, 0.0, 0.05);
+            assert!(events.is_empty(), "{events:?}");
+        }
+        assert_eq!(
+            (game.points(), game.final_score(), game.stars()),
+            (0, 0.0, 0)
+        );
+        let session = game.to_session(&patient(), Utc::now());
+        assert_eq!((session.reps, session.accuracy_percent), (0, 0.0));
+        // Ending early finishes the round with no credit.
+        assert!(matches!(
+            game.skip().last(),
+            Some(GameEvent::Finished { stars: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn a_3d_round_uses_the_patients_range_for_its_reach_and_both_levels_pick_their_diagonal() {
+        let full = Game::new_3d(GameLevel::PnfD1, Side::Right, Some(150.0), 5);
+        let small = Game::new_3d(GameLevel::PnfD1, Side::Right, Some(60.0), 5);
+        let (Mode::Pnf3d(a), Mode::Pnf3d(b)) = (&full.mode, &small.mode) else {
+            unreachable!()
+        };
+        assert!(a.config.reach > b.config.reach);
+        assert!(
+            (a.trajectory.end - b.trajectory.end).length() > 0.1,
+            "a smaller range shortens the diagonal"
+        );
+        assert_eq!(a.config.pattern, PnfPattern::D1Flexion);
+        let d2 = Game::new_3d(GameLevel::PnfD2, Side::Left, None, 5);
+        let Mode::Pnf3d(c) = &d2.mode else {
+            unreachable!()
+        };
+        assert_eq!(
+            (c.config.pattern, c.config.side),
+            (PnfPattern::D2Flexion, Side::Left)
+        );
     }
 }

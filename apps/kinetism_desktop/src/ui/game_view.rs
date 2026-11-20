@@ -506,7 +506,9 @@ impl KinetismApp {
                 }
             }
             ui.separator();
-            ui.checkbox(&mut self.play.bombs, "Bombs off the diagonal");
+            ui.checkbox(&mut self.play.bombs, "Bombs off the diagonal (2D)");
+            ui.separator();
+            ui.checkbox(&mut self.play.view3d, "3D arm and fruit (levels 1-2)");
             ui.separator();
             let mut unlock = self.store.settings.physio_unlock_all;
             if ui
@@ -538,15 +540,39 @@ impl KinetismApp {
         self.play.unlocked = None;
         self.play.paused = false;
         self.play.fx = Fx::default();
-        let mut game = Game::new(
-            level,
-            self.side(),
-            rom,
-            self.store.settings.reps_per_round,
-            self.play.bombs,
-            fastrand::u64(..),
-        );
+        let three_d = self.play.view3d && level != GameLevel::AppleTrace;
+        let mut game = if three_d {
+            Game::new_3d(level, self.side(), rom, self.store.settings.reps_per_round)
+        } else {
+            Game::new(
+                level,
+                self.side(),
+                rom,
+                self.store.settings.reps_per_round,
+                self.play.bombs,
+                fastrand::u64(..),
+            )
+        };
+        self.lab.push_trail(None);
         game.practice = self.practice_only();
+        // The simulator plays the matching reference movement for 3D rounds. It
+        // first holds a neutral forward pose while the forearm neutral is captured,
+        // and starts the movement at "Go".
+        self.play.pending_scenario = None;
+        if self.simulated()
+            && let Mode::Pnf3d(round) = &game.mode
+        {
+            let scenario = if level == GameLevel::PnfD1 {
+                crate::scenarios::Scenario::D1Flexion
+            } else {
+                crate::scenarios::Scenario::D2Flexion
+            };
+            self.sim.forward_pose();
+            if !self.tracker.has_rotation_calibration() {
+                self.tracker.start_neutral_capture();
+            }
+            self.play.pending_scenario = Some((scenario, round.config));
+        }
         self.play.game = Some(game);
         self.voice.say(
             match level {
@@ -603,6 +629,14 @@ impl KinetismApp {
             }
             Some("pause") => self.play.paused = !self.play.paused,
             _ => {}
+        }
+
+        if matches!(
+            self.play.game.as_ref().map(|g| &g.mode),
+            Some(Mode::Pnf3d(_))
+        ) {
+            self.game_canvas_3d(ui);
+            return;
         }
 
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::hover());
@@ -725,6 +759,8 @@ impl KinetismApp {
                     instruction = "Sliced! Next apple coming…".into();
                 }
             }
+            // Drawn by the 3D canvas (`game_canvas_3d`), never here.
+            Mode::Pnf3d(_) => instruction = String::new(),
             Mode::Pnf(round) => {
                 let path = round.path;
                 let guide: Vec<Pos2> = (0..=40)
@@ -840,6 +876,7 @@ impl KinetismApp {
                 crate::game::APPLES_PER_ROUND
             ),
             Mode::Pnf(r) => format!("Combo x{}  ·  Bombs {}", r.combo, r.bombs_hit),
+            Mode::Pnf3d(_) => String::new(),
         };
         hud(
             progress,
@@ -912,13 +949,18 @@ impl KinetismApp {
                 theme::WARN,
             );
         }
+        let inset = Rect::from_min_size(
+            rect.right_bottom() + Vec2::new(-236.0, -236.0),
+            Vec2::splat(220.0),
+        );
+        self.paint_arm_inset(&painter, inset);
         let finished = game.stage == Stage::Finished;
         if finished {
             self.result_overlay(ui, rect);
         }
     }
 
-    fn result_overlay(&mut self, ui: &mut egui::Ui, rect: Rect) {
+    pub(crate) fn result_overlay(&mut self, ui: &mut egui::Ui, rect: Rect) {
         let Some(result) = self.play.result.clone() else {
             return;
         };

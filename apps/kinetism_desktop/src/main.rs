@@ -4,12 +4,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod arm3d;
+mod armpose;
 mod clinical;
 mod demo;
+mod forearm;
 mod game;
 mod kinematics;
 mod math;
 mod model;
+mod pnf3d;
+mod scenarios;
 mod sensor;
 mod sim;
 mod store;

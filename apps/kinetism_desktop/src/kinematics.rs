@@ -53,11 +53,32 @@ pub struct ArmPose {
     pub hand: [f64; 2],
     /// Frontal-plane projection of the elbow in arm lengths.
     pub elbow: [f64; 2],
+    /// Forearm sensor orientation in the body frame (needs the forearm axis).
+    pub forearm_orientation: Option<Quat>,
 }
 
 impl Calibration {
     fn to_body(self, world: Vec3) -> Vec3 {
         rotate_about_z(world, FRAC_PI_2 - self.forward_heading)
+    }
+
+    /// A forearm sensor orientation expressed in the body frame.
+    pub fn forearm_body_orientation(&self, forearm: Quat) -> Quat {
+        Quat::from_axis_angle(Vec3::Z, FRAC_PI_2 - self.forward_heading)
+            * Quat::from_axis_angle(Vec3::Z, self.forearm_yaw_offset)
+            * forearm
+    }
+
+    /// Where the palm points in the forearm sensor's own frame, given the
+    /// sensor orientation while the forearm is held in its neutral position
+    /// (mid-position, elbow straight: the palm faces the body). Later palm
+    /// directions are this vector turned by the sensor's orientation.
+    pub fn neutral_palm_in_sensor(&self, forearm: Quat, side: Side) -> Option<Vec3> {
+        let axis = self.forearm_axis?;
+        let body = self.forearm_body_orientation(forearm);
+        let forearm_dir = body.rotate(axis).normalized()?;
+        let palm = crate::arm3d::neutral_palm_normal(forearm_dir, side);
+        Some(body.conjugate().rotate(palm))
     }
 
     pub fn pose(&self, upper: Quat, forearm: Option<Quat>, side: Side) -> ArmPose {
@@ -87,6 +108,10 @@ impl Calibration {
             elbow_flexion_deg,
             hand: [hand_point.x, hand_point.z],
             elbow: [elbow_point.x, elbow_point.z],
+            forearm_orientation: match (forearm, self.forearm_axis) {
+                (Some(q), Some(_)) => Some(self.forearm_body_orientation(q)),
+                _ => None,
+            },
         }
     }
 }
@@ -294,6 +319,12 @@ pub struct SimArm {
     pub elevation_deg: f64,
     pub plane_deg: f64,
     pub elbow_deg: f64,
+    /// Forearm rotation about its own axis: pronation positive, supination negative.
+    pub pronation_deg: f64,
+    /// Humeral rotation about the upper arm's long axis, external positive.
+    pub axial_deg: f64,
+    /// A scripted shoulder orientation that replaces elevation/plane/axial.
+    pub humerus: Option<Quat>,
     /// Heading the patient faces in the upper sensor's world frame.
     pub facing: f64,
     /// Yaw difference between the two sensors' world frames.
@@ -309,6 +340,9 @@ impl SimArm {
             elevation_deg: 0.0,
             plane_deg: 0.0,
             elbow_deg: 0.0,
+            pronation_deg: 0.0,
+            axial_deg: 0.0,
+            humerus: None,
             facing: 0.7,
             forearm_world_yaw: -1.1,
             // Sensor +X along the segment, rotated arbitrarily about it.
@@ -321,6 +355,7 @@ impl SimArm {
 
     /// Straight-elbow pose whose hand projects onto `(x, up)` (arm lengths).
     pub fn set_hand_target(&mut self, x: f64, up: f64) {
+        self.humerus = None;
         let mut x = x;
         let mut z = up;
         let r = (x * x + z * z).sqrt();
@@ -334,17 +369,34 @@ impl SimArm {
         self.elbow_deg = 0.0;
     }
 
+    /// Take shoulder, elbow and forearm rotation from a joint-space state.
+    pub fn apply_state(&mut self, state: &crate::armpose::ArmState) {
+        self.humerus = Some(state.humerus);
+        self.elbow_deg = state.elbow_deg;
+        self.pronation_deg = state.pronation_deg;
+    }
+
+    /// Slider control: drop any scripted shoulder orientation.
+    pub fn clear_scripted_shoulder(&mut self) {
+        self.humerus = None;
+    }
+
     fn body_directions(&self) -> (Quat, Quat) {
-        let e = self.elevation_deg.to_radians();
-        let p = self.plane_deg.to_radians();
-        let u = Vec3::new(
-            self.side.sign() * e.sin() * p.cos(),
-            e.sin() * p.sin(),
-            -e.cos(),
-        );
-        let shoulder = Quat::from_two_vectors(Vec3::DOWN, u);
-        let elbow = Quat::from_axis_angle(Vec3::X, self.elbow_deg.to_radians());
-        (shoulder, shoulder * elbow)
+        let state = crate::armpose::ArmState {
+            humerus: self.humerus.unwrap_or_else(|| {
+                crate::armpose::JointPose {
+                    plane_deg: self.plane_deg,
+                    elevation_deg: self.elevation_deg,
+                    axial_deg: self.axial_deg,
+                    elbow_deg: 0.0,
+                    pronation_deg: 0.0,
+                }
+                .humerus(self.side)
+            }),
+            elbow_deg: self.elbow_deg,
+            pronation_deg: self.pronation_deg,
+        };
+        (state.humerus, state.forearm_orientation(self.side))
     }
 
     /// Quaternions as the firmware would report them: (upper, forearm).

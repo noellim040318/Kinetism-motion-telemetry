@@ -153,6 +153,33 @@ impl Quat {
             .unwrap_or(Quat::IDENTITY)
     }
 
+    /// Spherical interpolation along the shortest arc (`t` in 0..=1).
+    pub fn slerp(self, other: Quat, t: f64) -> Quat {
+        let t = t.clamp(0.0, 1.0);
+        let mut b = other;
+        let mut d = self.w * b.w + self.x * b.x + self.y * b.y + self.z * b.z;
+        if d < 0.0 {
+            b = Quat::new(-b.w, -b.x, -b.y, -b.z);
+            d = -d;
+        }
+        let (s0, s1) = if d > 0.9995 {
+            (1.0 - t, t)
+        } else {
+            let theta0 = d.clamp(-1.0, 1.0).acos();
+            let theta = theta0 * t;
+            let sin0 = theta0.sin();
+            (theta.cos() - d * theta.sin() / sin0, theta.sin() / sin0)
+        };
+        Quat::new(
+            self.w * s0 + b.w * s1,
+            self.x * s0 + b.x * s1,
+            self.y * s0 + b.y * s1,
+            self.z * s0 + b.z * s1,
+        )
+        .normalized()
+        .unwrap_or(self)
+    }
+
     /// Rotate a vector by this (unit) quaternion.
     pub fn rotate(self, v: Vec3) -> Vec3 {
         let u = Vec3::new(self.x, self.y, self.z);
@@ -235,6 +262,28 @@ mod tests {
             Quat::from_two_vectors(from, -from).rotate(from),
             -from
         ));
+    }
+
+    #[test]
+    fn slerp_follows_the_shortest_arc_at_constant_speed() {
+        let a = Quat::from_axis_angle(Vec3::Z, 0.2);
+        let b = Quat::from_axis_angle(Vec3::Z, 1.4);
+        assert!(close(a.slerp(b, 0.0).rotate(Vec3::X), a.rotate(Vec3::X)));
+        assert!(close(a.slerp(b, 1.0).rotate(Vec3::X), b.rotate(Vec3::X)));
+        let mid = a.slerp(b, 0.5);
+        assert!(close(
+            mid.rotate(Vec3::X),
+            Quat::from_axis_angle(Vec3::Z, 0.8).rotate(Vec3::X)
+        ));
+        // q and -q are the same rotation: the short way round is taken either way.
+        let neg = Quat::new(-b.w, -b.x, -b.y, -b.z);
+        assert!(close(
+            a.slerp(neg, 0.5).rotate(Vec3::X),
+            mid.rotate(Vec3::X)
+        ));
+        // Nearly equal rotations and out-of-range t stay unit and finite.
+        assert!((a.slerp(a, 0.3).norm() - 1.0).abs() < 1e-12);
+        assert!(close(a.slerp(b, 7.0).rotate(Vec3::X), b.rotate(Vec3::X)));
     }
 
     #[test]

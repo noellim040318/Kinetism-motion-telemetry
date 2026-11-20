@@ -2,7 +2,7 @@
 //! simulator and optional PNG screenshot (`KINETISM_SCREENSHOT=<path>`).
 //!
 //! Scenarios: patients, hub, calibrate, measure, play, game0, game1, game2,
-//! result, progress, progress-patient, records. Demo mode never syncs to
+//! result, lab (3D arm demo, see `KINETISM_LAB_OPTS`), progress, progress-patient, records. Demo mode never syncs to
 //! Firestore and uses a throwaway data folder.
 
 use crate::app::{Audience, KinetismApp, MeasureStage, Screen};
@@ -41,6 +41,7 @@ pub fn setup(app: &mut KinetismApp) {
             Screen::Measure
         }
         "play" | "game0" | "game1" | "game2" | "result" => Screen::Play,
+        "lab" => Screen::Lab3d,
         "progress" => Screen::Progress,
         "progress-patient" => {
             app.progress.audience = Audience::Patient;
@@ -51,6 +52,14 @@ pub fn setup(app: &mut KinetismApp) {
     };
     if s == "calibrate" {
         app.tracker.start_rest_capture();
+    }
+    if s == "lab" {
+        if let Ok(options) = std::env::var("KINETISM_LAB_OPTS")
+            && let Some(side) = app.lab.apply_demo_options(&options)
+        {
+            app.set_side(side);
+        }
+        app.run_lab_demo();
     }
 }
 
@@ -243,6 +252,10 @@ pub fn autopilot(app: &mut KinetismApp, dt: f64) {
             let Some(game) = app.play.game.as_ref() else {
                 return;
             };
+            if matches!(game.mode, Mode::Pnf3d(_)) {
+                // A 3D round is played by the simulator's reference scenario.
+                return;
+            }
             let goal = match &game.mode {
                 Mode::Apple(round) => {
                     let t = &round.tracer;
@@ -252,6 +265,7 @@ pub fn autopilot(app: &mut KinetismApp, dt: f64) {
                         t.path.points[(t.next + 3).min(t.path.points.len() - 1)]
                     }
                 }
+                Mode::Pnf3d(_) => unreachable!("handled above"),
                 Mode::Pnf(round) => match round.phase {
                     Phase::GoToStart | Phase::Return | Phase::Done => round.path.start,
                     Phase::Swipe => {
@@ -268,7 +282,7 @@ pub fn autopilot(app: &mut KinetismApp, dt: f64) {
             };
             let current = match app.sim.input {
                 SimInput::HandTarget(p) => p,
-                SimInput::Sliders => hand,
+                SimInput::Sliders | SimInput::Scenario => hand,
             };
             app.sim.input = SimInput::HandTarget(move_towards(current, goal, 0.95 * dt));
         }

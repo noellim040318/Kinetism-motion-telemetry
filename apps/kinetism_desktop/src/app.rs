@@ -2,7 +2,7 @@
 
 use crate::clinical::{Anthropometrics, Movement, Muscle, Side};
 use crate::game::fx::Fx;
-use crate::game::{Game, GameEvent, Stage};
+use crate::game::{Game, GameEvent, Mode, Stage};
 use crate::model::{GameLevel, GameSession, Patient};
 use crate::sensor::udp::LocalIpCache;
 use crate::sensor::{LinkState, SensorHub, Source};
@@ -23,6 +23,7 @@ pub enum Screen {
     Hub,
     Measure,
     Play,
+    Lab3d,
     Progress,
     Records,
 }
@@ -81,6 +82,10 @@ pub struct PlayState {
     pub unlocked: Option<GameLevel>,
     pub paused: bool,
     pub bombs: bool,
+    /// Levels 1-2 use the 3D arm and fruit (the 2D game stays available).
+    pub view3d: bool,
+    /// Simulated 3D round waiting for the forearm neutral and the "Go".
+    pub pending_scenario: Option<(crate::scenarios::Scenario, crate::pnf3d::PnfConfig)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,6 +140,7 @@ pub struct KinetismApp {
     pub play: PlayState,
     pub progress: ProgressState,
     pub records: RecordsState,
+    pub lab: crate::ui::lab3d::LabState,
     pub toast: Option<Toast>,
     pub demo: Option<Demo>,
     pub project: Option<String>,
@@ -242,6 +248,8 @@ impl KinetismApp {
                 unlocked: None,
                 paused: false,
                 bombs: true,
+                view3d: true,
+                pending_scenario: None,
             },
             progress: ProgressState {
                 audience: Audience::Physio,
@@ -252,6 +260,7 @@ impl KinetismApp {
                 overall: false,
                 tab: RecordsTab::Measurements,
             },
+            lab: crate::ui::lab3d::LabState::new(side),
             toast: None,
             demo,
             project,
@@ -303,6 +312,7 @@ impl KinetismApp {
 
     fn discard_game(&mut self) {
         self.play.game = None;
+        self.play.pending_scenario = None;
         self.play.result = None;
         self.play.unlocked = None;
         self.play.paused = false;
@@ -725,10 +735,56 @@ impl KinetismApp {
     /// the gap, and a dropout cannot time out reps and save a low score.
     /// `resumed` says the frames just came back after such a gap, which no app
     /// frame may have seen when it was barely longer than the limit.
+    /// A 3D round: the same tracked arm as the 3D view drives the blade, and
+    /// collisions are tested in 3D. Without tracking nothing is scored.
+    fn update_game_3d(&mut self, dt: f64, resumed: bool, practice: bool, following: bool) {
+        // A simulated round starts its movement at "Go", once the forearm neutral is
+        // captured: the palm needs it to follow the simulated forearm.
+        if let Some((scenario, config)) = self.play.pending_scenario
+            && self.tracker.has_rotation_calibration()
+            && self
+                .play
+                .game
+                .as_ref()
+                .is_some_and(|g| g.stage == Stage::Playing)
+        {
+            self.sim.start_scenario(scenario, config);
+            self.play.pending_scenario = None;
+        }
+        let elevation = self.tracker.pose.map_or(0.0, |p| p.elevation_deg);
+        let frame = following
+            .then(|| self.tracker.skeleton())
+            .flatten()
+            .and_then(|sk| crate::pnf3d::Frame::from_skeleton(&sk, None));
+        self.lab.push_trail(frame.map(|f| f.blade_tip));
+        let Some(game) = self.play.game.as_mut() else {
+            return;
+        };
+        game.practice |= practice;
+        if game.stage == Stage::Finished {
+            return;
+        }
+        if frame.is_none() || resumed {
+            game.interrupt();
+        }
+        let (events, raw) = game.update_3d(frame, elevation, dt);
+        for e in raw {
+            self.lab.round_feedback(&e);
+        }
+        self.handle_game_events(&events);
+    }
+
     fn update_game(&mut self, dt: f64, resumed: bool) {
         self.play.fx.update(dt);
         let practice = self.practice_only();
         let following = !self.play.paused && self.tracker.has_fresh_data();
+        if matches!(
+            self.play.game.as_ref().map(|g| &g.mode),
+            Some(Mode::Pnf3d(_))
+        ) {
+            self.update_game_3d(dt, resumed, practice, following);
+            return;
+        }
         let hand = self.tracker.hand.filter(|_| following);
         let elevation = self.tracker.pose.map_or(0.0, |p| p.elevation_deg);
         let Some(game) = self.play.game.as_mut() else {
@@ -772,6 +828,7 @@ impl KinetismApp {
         self.note_wifi_sender(self.sensor.stats().wifi_sender);
         let resumed = self.tracker.feed(&frames);
         self.update_game(dt, resumed);
+        self.update_lab(dt, resumed);
     }
 }
 
@@ -806,6 +863,7 @@ impl eframe::App for KinetismApp {
                 Screen::Hub => self.hub_screen(ui),
                 Screen::Measure => self.measure_screen(ui),
                 Screen::Play => self.play_screen(ui),
+                Screen::Lab3d => self.lab_screen(ui),
                 Screen::Progress => self.progress_screen(ui),
                 Screen::Records => self.records_screen(ui),
             });
@@ -815,6 +873,7 @@ impl eframe::App for KinetismApp {
         self.toast_overlay(&ctx);
         if self.sensor.state().is_live()
             || self.play.game.is_some()
+            || self.screen == Screen::Lab3d
             || !self.play.fx.particles.is_empty()
         {
             ctx.request_repaint();
@@ -860,7 +919,10 @@ pub(crate) mod tests {
             dir.join(cache_file_name(None)),
         );
         let sensor = SensorHub::new(runtime.handle(), ctx, 0);
-        KinetismApp::assemble(runtime, store, sensor, Voice::muted(), None, None)
+        let mut app = KinetismApp::assemble(runtime, store, sensor, Voice::muted(), None, None);
+        // The existing app tests exercise the classic 2D game; 3D has its own tests.
+        app.play.view3d = false;
+        app
     }
 
     pub(crate) fn demo(scenario: &str) -> Demo {
@@ -948,10 +1010,14 @@ pub(crate) mod tests {
         app.play.game.as_ref().expect("a round")
     }
 
+    fn round_game(app: &KinetismApp) -> &Game {
+        round(app)
+    }
+
     fn pnf_path(app: &KinetismApp) -> crate::game::pnf::Diagonal {
         match &round(app).mode {
             Mode::Pnf(r) => r.path,
-            Mode::Apple(_) => unreachable!("a PNF level"),
+            Mode::Apple(_) | Mode::Pnf3d(_) => unreachable!("a 2D PNF level"),
         }
     }
 
@@ -1106,6 +1172,251 @@ pub(crate) mod tests {
             assert!(app.store.games.is_empty() && app.store.records.is_empty());
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn the_real_game_plays_levels_1_and_2_in_3d_with_the_shared_tracked_arm() {
+        for (level, scenario_name) in [(GameLevel::PnfD1, "D1"), (GameLevel::PnfD2, "D2")] {
+            let dir = test_dir("game-3d");
+            let mut app = test_app(&dir);
+            app.play.view3d = true;
+            app.store.upsert_patient(patient("p1"));
+            app.select_patient("p1", false);
+            calibrate_simulator(&mut app);
+
+            app.start_game(level);
+            let Mode::Pnf3d(round) = &round(&app).mode else {
+                panic!("{scenario_name}: the real game launched the 2D round");
+            };
+            assert_eq!(
+                round.config.pattern,
+                if level == GameLevel::PnfD1 {
+                    crate::pnf3d::PnfPattern::D1Flexion
+                } else {
+                    crate::pnf3d::PnfPattern::D2Flexion
+                },
+            );
+            let reps = round.config.reps;
+            // The forearm neutral is captured first; the movement starts at "Go".
+            assert!(app.play.pending_scenario.is_some());
+            app.advance(3.3);
+            app.advance(0.05); // the first frame of play starts the movement
+            assert_eq!(
+                app.sim.input,
+                SimInput::Scenario,
+                "the simulator plays the pattern"
+            );
+            assert!(
+                app.tracker.has_rotation_calibration(),
+                "the palm needs the neutral"
+            );
+
+            // Play the whole round through the real frame loop: sensor packets,
+            // calibration, forward kinematics, 3D collision, scoring.
+            for _ in 0..(f64::from(reps) * 8.0 / 0.05) as usize + 400 {
+                app.advance(0.05);
+                if app.play.result.is_some() {
+                    break;
+                }
+            }
+            let game = round_game(&app);
+            assert_eq!(
+                game.stage,
+                Stage::Finished,
+                "{scenario_name}: the round completes"
+            );
+            let Mode::Pnf3d(finished) = &game.mode else {
+                unreachable!()
+            };
+            assert_eq!(finished.scored_reps(), reps);
+            assert!(
+                finished
+                    .results
+                    .iter()
+                    .all(|r| r.fruits_sliced == r.fruits_total)
+            );
+            assert!(
+                game.final_score() > 90.0,
+                "{scenario_name}: {}",
+                game.final_score()
+            );
+            let result = app.play.result.as_ref().expect("a result screen");
+            assert_eq!(result.level, level);
+            // The arm drawn is the tracked one: the blade trail followed the wrist.
+            assert!(app.tracker.skeleton().is_some());
+            // Simulator rounds are practice: shown, never saved, never unlocking.
+            assert!(app.store.games.is_empty(), "practice round was saved");
+            assert!(app.play.unlocked.is_none());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The tracked arm must equal the simulated joints: wrist, elbow, forearm
+    /// rotation and palm all come through the sensor pipeline.
+    fn assert_arm_matches_the_simulated_joints(app: &KinetismApp, what: &str) {
+        let truth = app.sim.truth().expect("a running scenario");
+        let side = app.side();
+        let want = truth.skeleton(side);
+        let got = app.tracker.skeleton().expect("a tracked arm");
+        let pose = app.tracker.pose.expect("a pose");
+        assert!(
+            (got.wrist - want.wrist).length() < 0.03,
+            "{what}: wrist {:?} vs {:?}",
+            got.wrist,
+            want.wrist
+        );
+        assert!(
+            (pose.elbow_flexion_deg.unwrap() - truth.elbow_deg).abs() < 2.0,
+            "{what}: elbow {:?} vs {}",
+            pose.elbow_flexion_deg,
+            truth.elbow_deg
+        );
+        let rotation = app
+            .tracker
+            .reliable_rotation_deg()
+            .expect("a forearm rotation estimate");
+        assert!(
+            (rotation - truth.pronation_deg).abs() < 2.0,
+            "{what}: forearm rotation {rotation} vs {}",
+            truth.pronation_deg
+        );
+        let palm = got.palm_normal.angle_to(want.palm_normal).to_degrees();
+        let thumb = got.thumb_dir.angle_to(want.thumb_dir).to_degrees();
+        assert!(
+            palm < 3.0 && thumb < 3.0,
+            "{what}: palm {palm} deg, thumb {thumb} deg off"
+        );
+    }
+
+    #[test]
+    fn the_lab_and_the_real_game_show_the_same_simulated_joint_state() {
+        use crate::clinical::Side;
+        for side in [Side::Right, Side::Left] {
+            // The 3D Lab.
+            let dir = test_dir("same-state-lab");
+            let mut app = test_app(&dir);
+            app.store.upsert_patient(patient("p1"));
+            app.select_patient("p1", false);
+            app.set_side(side);
+            app.run_lab_demo();
+            let mut checked = 0;
+            let mut elbow_seen = (f64::MAX, f64::MIN);
+            for _ in 0..900 {
+                app.advance(0.05);
+                if app.sim.truth().is_some() && app.tracker.has_rotation_calibration() {
+                    assert_arm_matches_the_simulated_joints(&app, &format!("lab {side:?}"));
+                    let e = app.sim.truth().unwrap().elbow_deg;
+                    elbow_seen = (elbow_seen.0.min(e), elbow_seen.1.max(e));
+                    checked += 1;
+                }
+            }
+            assert!(
+                checked > 300,
+                "{side:?}: the Lab ran its scenario ({checked})"
+            );
+            assert!(
+                elbow_seen.1 - elbow_seen.0 > 25.0,
+                "the Lab elbow moved: {elbow_seen:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+
+            // The real game, both diagonals.
+            for level in [GameLevel::PnfD1, GameLevel::PnfD2] {
+                let dir = test_dir("same-state-game");
+                let mut app = test_app(&dir);
+                app.play.view3d = true;
+                app.store.upsert_patient(patient("p1"));
+                app.select_patient("p1", false);
+                app.set_side(side);
+                calibrate_simulator(&mut app);
+                app.start_game(level);
+                let mut checked = 0;
+                let mut elbow_seen = (f64::MAX, f64::MIN);
+                let mut rotation_seen = (f64::MAX, f64::MIN);
+                for _ in 0..900 {
+                    app.advance(0.05);
+                    if let Some(t) = app.sim.truth() {
+                        assert_arm_matches_the_simulated_joints(
+                            &app,
+                            &format!("game {level:?} {side:?}"),
+                        );
+                        elbow_seen = (elbow_seen.0.min(t.elbow_deg), elbow_seen.1.max(t.elbow_deg));
+                        rotation_seen = (
+                            rotation_seen.0.min(t.pronation_deg),
+                            rotation_seen.1.max(t.pronation_deg),
+                        );
+                        checked += 1;
+                    }
+                    if app.play.result.is_some() {
+                        break;
+                    }
+                }
+                assert!(
+                    checked > 200,
+                    "{level:?} {side:?}: the game ran its scenario ({checked})"
+                );
+                assert!(
+                    elbow_seen.1 - elbow_seen.0 > 25.0,
+                    "{level:?} {side:?}: elbow moved {elbow_seen:?}"
+                );
+                assert!(
+                    rotation_seen.1 - rotation_seen.0 > 40.0,
+                    "{level:?} {side:?}: forearm rotated {rotation_seen:?}"
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
+
+    #[test]
+    fn the_3d_game_scores_nothing_while_sensor_data_is_missing() {
+        let dir = test_dir("game-3d-gap");
+        let mut app = test_app(&dir);
+        app.play.view3d = true;
+        app.store.upsert_patient(patient("p1"));
+        app.select_patient("p1", false);
+        calibrate_simulator(&mut app);
+        app.start_game(GameLevel::PnfD2);
+        app.advance(3.1);
+        // Stop the simulator's packets: the arm freezes, data goes stale.
+        app.sim.stop_scenario();
+        app.sensor.disconnect();
+        // Data freshness is wall-clock time: wait until the last frame is stale.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        for _ in 0..400 {
+            app.advance(0.05);
+        }
+        let Mode::Pnf3d(r) = &round(&app).mode else {
+            panic!("3D round")
+        };
+        assert_eq!((r.rep, r.scored_reps(), r.points), (0, 0, 0));
+        assert!(!app.tracker.has_fresh_data());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn level_zero_and_the_2d_game_keep_working_and_levels_choose_their_view() {
+        let dir = test_dir("game-views");
+        let mut app = test_app(&dir);
+        app.store.upsert_patient(patient("p1"));
+        app.select_patient("p1", false);
+        calibrate_simulator(&mut app);
+        app.play.view3d = true;
+        app.start_game(GameLevel::AppleTrace);
+        assert!(
+            matches!(&round(&app).mode, Mode::Apple(_)),
+            "Level 0 is a 2D trace (with the 3D arm inset)"
+        );
+        app.play.view3d = false;
+        app.start_game(GameLevel::PnfD1);
+        assert!(
+            matches!(&round(&app).mode, Mode::Pnf(_)),
+            "classic 2D stays available"
+        );
+        app.play.view3d = true;
+        app.start_game(GameLevel::PnfD1);
+        assert!(matches!(&round(&app).mode, Mode::Pnf3d(_)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
